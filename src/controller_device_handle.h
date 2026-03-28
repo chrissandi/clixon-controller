@@ -47,6 +47,7 @@
 #define DH_FLAG_YANG_ANNOUNCE_LATEST 0x08 /* If device announces multiple YANGs, 0: use earliest revision, 1: use latest */
 #define DH_FLAG_SKIP_CANDIDATE    0x10 /* Skip candidate datastore, use writable-running */
 #define DH_FLAG_MODULE_SET_CONFIG 0x20 /* User-configured module-set (for get-config filter) */
+#define DH_FLAG_SKIP_STATE_SCHEMAS 0x40 /* Skip netconf-state schemas discovery */
 
 #ifndef NETCONF_CANDIDATE_CAPABILITY
 #define NETCONF_CANDIDATE_CAPABILITY "urn:ietf:params:netconf:capability:candidate:1.0"
