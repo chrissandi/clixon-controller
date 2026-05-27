@@ -120,12 +120,33 @@ device_send_get(clixon_handle h,
                 int           state,
                 const char   *xpath)
 {
-    int   retval = -1;
-    cbuf *cb = NULL;
+    int    retval = -1;
+    cbuf  *cb = NULL;
+    cxobj *xyanglib = NULL;
+    cxobj *xmodule = NULL;
+    char  *filter_ns = NULL;
+    char  *filter_name = NULL;
 
     if ((cb = cbuf_new()) == NULL){
         clixon_err(OE_PLUGIN, errno, "cbuf_new");
         goto done;
+    }
+    /* Check if device has a user-configured module-set - if so, extract namespace for filter.
+     * Only apply filter when explicitly configured (DH_FLAG_MODULE_SET_CONFIG),
+     * not for auto-discovered yang-lib from schema discovery. */
+    xyanglib = device_handle_yang_lib_get(dh);
+    if (xyanglib != NULL && device_handle_flag_get(dh, DH_FLAG_MODULE_SET_CONFIG)) {
+        xmodule = xpath_first(xyanglib, 0, "module-set/module");
+        if (xmodule != NULL) {
+            filter_ns = xml_find_body(xmodule, "namespace");
+            /* Use filter-element if configured, otherwise fall back to module name */
+            filter_name = xml_find_body(xmodule, "filter-element");
+            if (filter_name == NULL)
+                filter_name = xml_find_body(xmodule, "name");
+            clixon_debug(CLIXON_DBG_CTRL, "%s: using filter element '%s' with namespace '%s'",
+                         device_handle_name_get(dh), filter_name ? filter_name : "null",
+                         filter_ns ? filter_ns : "null");
+        }
     }
     cprintf(cb, "<rpc xmlns=\"%s\" message-id=\"%" PRIu64 "\">",
             NETCONF_BASE_NAMESPACE,
@@ -134,11 +155,51 @@ device_send_get(clixon_handle h,
         cprintf(cb, "<get>");
         if (xpath)
             cprintf(cb, "<filter type=\"xpath\" select=\"%s\"/>", xpath); // XXX xmlns
+        else if (filter_ns && filter_name) {
+            /* Add subtree filter for devices requiring namespace (e.g., NX-OS) */
+            cprintf(cb, "<filter type=\"subtree\"><%s xmlns=\"%s\"/></filter>",
+                    filter_name, filter_ns);
+        }
         cprintf(cb, "</get>");
     }
     else {
         cprintf(cb, "<get-config>");
         cprintf(cb, "<source><running/></source>");
+        if (filter_ns && filter_name) {
+            /* Try to build subtree filter from mounted yspec top-level data nodes.
+             * This finds the actual XML element names (e.g. "ifm" vs "huawei-ifm").
+             * Falls back to filter_name from yang-library if yspec is unavailable.
+             */
+            yang_stmt *yspec1 = NULL;
+            int use_yspec = 0;
+            if (controller_mount_yspec_get(h, device_handle_name_get(dh), &yspec1) == 0
+                && yspec1 != NULL){
+                yang_stmt *ymod = yang_find(yspec1, Y_MODULE, xml_find_body(xmodule, "name"));
+                if (ymod != NULL){
+                    yang_stmt *ych = NULL;
+                    int        inext_ch = 0;
+                    cbuf      *cbf = cbuf_new();
+                    if (cbf){
+                        while ((ych = yn_iter(ymod, &inext_ch)) != NULL){
+                            int kw = yang_keyword_get(ych);
+                            if (kw == Y_CONTAINER || kw == Y_LIST || kw == Y_LEAF || kw == Y_LEAF_LIST){
+                                cprintf(cbf, "<%s xmlns=\"%s\"/>",
+                                        yang_argument_get(ych), filter_ns);
+                                use_yspec++;
+                            }
+                        }
+                        if (use_yspec > 0)
+                            cprintf(cb, "<filter type=\"subtree\">%s</filter>", cbuf_get(cbf));
+                        cbuf_free(cbf);
+                    }
+                }
+            }
+            if (!use_yspec){
+                /* Fallback: use module name or filter-element directly */
+                cprintf(cb, "<filter type=\"subtree\"><%s xmlns=\"%s\"/></filter>",
+                        filter_name, filter_ns);
+            }
+        }
         cprintf(cb, "</get-config>");
     }
     cprintf(cb, "</rpc>");

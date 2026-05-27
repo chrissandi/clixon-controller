@@ -450,8 +450,11 @@ device_schemas_mount_parse(clixon_handle h,
                            cxobj        *xyanglib)
 {
     int        retval = -1;
-    yang_stmt *yspec1;
+    yang_stmt *yspec1 = NULL;
+    yang_stmt *ymounts;
+    yang_stmt *ydomain;
     char      *domain;
+    char      *digest = NULL;
     int        ret;
 
     clixon_debug(CLIXON_DBG_CTRL | CLIXON_DBG_DETAIL, "");
@@ -460,16 +463,31 @@ device_schemas_mount_parse(clixon_handle h,
         device_close_connection(dh, "Empty set of YANG modules");
         goto fail;
     }
-    if (controller_mount_yspec_get(h,
-                                   device_handle_name_get(dh),
-                                   &yspec1) < 0)
-        goto done;
-    if (yspec1 == NULL){
-        clixon_err(OE_YANG, 0, "No yang spec");
-        goto done;
-    }
     if ((domain = device_handle_domain_get(dh)) == NULL){
         clixon_err(OE_YANG, 0, "No YANG domain");
+        goto done;
+    }
+    /* Look up yspec by digest to ensure we load modules into the correct yspec
+     * (the one registered by CS_SCHEMA_LIST), not a stale one from the initial
+     * yang_mount callback that may have been created with a different digest.
+     */
+    if (xyanglib_digest(xyanglib, &digest) < 0)
+        goto done;
+    if ((ymounts = clixon_yang_mounts_get(h)) == NULL){
+        clixon_err(OE_YANG, ENOENT, "Top-level yang mounts not found");
+        goto done;
+    }
+    if ((ydomain = yang_find(ymounts, Y_DOMAIN, domain)) != NULL)
+        yspec1 = yang_find(ydomain, Y_SPEC, digest);
+    if (yspec1 == NULL){
+        /* Fallback: try xpath-based lookup */
+        if (controller_mount_yspec_get(h,
+                                       device_handle_name_get(dh),
+                                       &yspec1) < 0)
+            goto done;
+    }
+    if (yspec1 == NULL){
+        clixon_err(OE_YANG, 0, "No yang spec");
         goto done;
     }
     /* Given yang-lib, actual parsing of all modules into yspec */
@@ -482,6 +500,8 @@ device_schemas_mount_parse(clixon_handle h,
     }
     retval = 1;
  done:
+    if (digest)
+        free(digest);
     clixon_debug(CLIXON_DBG_CTRL | CLIXON_DBG_DETAIL, "retval %d", retval);
     return retval;
  fail:
@@ -1383,6 +1403,11 @@ device_state_handler(clixon_handle h,
                                 device_handle_framing_type_get(dh) == NETCONF_SSH_CHUNKED,
                                 device_handle_flag_get(dh, DH_FLAG_PRIVATE_CANDIDATE)) < 0)
             goto done;
+        /* Brief delay after hello to ensure the device processes it before we send RPCs.
+         * Some devices (e.g. Huawei VRP) silently drop RPCs received in the same TCP segment
+         * as the client hello.
+         */
+        usleep(100000); /* 100ms */
         /* The device is OK */
         if (ct->ct_state == TS_RESOLVED && ct->ct_result == TR_SUCCESS){
             clixon_err(OE_XML, 0, "Transaction unexpected SUCCESS state");
@@ -1400,10 +1425,12 @@ device_state_handler(clixon_handle h,
                 break;
             }
         }
-        if (!device_handle_capabilities_find(dh, NETCONF_MONITORING_NAMESPACE)){
-            clixon_debug(CLIXON_DBG_CTRL, "Device %s: Netconf monitoring capability %s not announced in hello protocol",
+        if (!device_handle_capabilities_find(dh, NETCONF_MONITORING_NAMESPACE) ||
+            (device_handle_flag_get(dh, DH_FLAG_SKIP_STATE_SCHEMAS) && xyanglib != NULL)){
+            clixon_debug(CLIXON_DBG_CTRL, "Device %s: Netconf monitoring %s",
                          name,
-                         NETCONF_MONITORING_NAMESPACE);
+                         device_handle_capabilities_find(dh, NETCONF_MONITORING_NAMESPACE) ?
+                         "announced but skipped (netconf-state-schemas=false)" : "not announced");
             if (xyanglib == NULL){
                 if (controller_transaction_failed(h, tid, ct, dh, TR_FAILED_DEV_CLOSE, name,
                                                   "Netconf monitoring capability not announced in hello protocol and no local models found") < 0)
@@ -1683,9 +1710,22 @@ device_state_handler(clixon_handle h,
         /* Receive config data, force transient, ie do not commit */
         if ((ret = device_recv_config(h, dh, xmsg, yspec0, rpcname, conn_state, 1, 0)) < 0)
             goto done;
-        /* Compare transient with last sync 0: closed, 1: unequal, 2: is equal */
-        if (ret && (ret = device_config_compare(h, dh, name, ct, &cberr)) < 0)
-            goto done;
+        /* For writable-running (skip-candidate) devices, the device may auto-update
+         * fields (e.g. lldp/system-name mirrors hostname) which causes SYNCED vs
+         * TRANSIENT mismatch. Accept the current device state as the new baseline
+         * by copying TRANSIENT to SYNCED before proceeding with the push.
+         */
+        if (ret && device_handle_flag_get(dh, DH_FLAG_SKIP_CANDIDATE)){
+            clixon_debug(CLIXON_DBG_CTRL, "%s: skip-candidate copying TRANSIENT to SYNCED", name);
+            if (device_config_copy(h, name, "TRANSIENT", "SYNCED") < 0)
+                goto done;
+            ret = 2; /* Treat as equal, proceed with push */
+        }
+        else {
+            /* Compare transient with last sync 0: closed, 1: unequal, 2: is equal */
+            if (ret && (ret = device_config_compare(h, dh, name, ct, &cberr)) < 0)
+                goto done;
+        }
         if (ret == 0){ /* closed */
             if (controller_transaction_failed(h, tid, ct, dh, TR_FAILED_DEV_LEAVE, name, device_handle_logmsg_get(dh)) < 0)
                 goto done;
@@ -2224,9 +2264,70 @@ devices_statedata(clixon_handle   h,
             goto done;
         cbuf_reset(cb);
     } /* devices */
+    /* Add yang-library state data for each device under config mount point.
+     * Only for devices whose mounted YANG spec has the yang-library container (RFC 8525).
+     * Devices with only RFC 7895 (ietf-yang-library@2016) have modules-state
+     * but not yang-library, so skip to avoid YANG validation failure. */
+    dh = NULL;
+    while ((dh = device_handle_each(h, dh)) != NULL){
+        cxobj     *xyanglib;
+        cxobj     *xmodset;
+        cxobj     *xmod;
+        char      *mod_name;
+        char      *mod_revision;
+        char      *mod_namespace;
+        char      *modset_name;
+        yang_stmt *yspec1 = NULL;
+        yang_stmt *ylib = NULL;
+
+        name = device_handle_name_get(dh);
+        xyanglib = device_handle_yang_lib_get(dh);
+        if (xyanglib == NULL)
+            continue;
+        /* Skip devices whose YANG spec lacks the yang-library container */
+        if (controller_mount_yspec_get(h, name, &yspec1) < 0 || yspec1 == NULL)
+            continue;
+        if (yang_abs_schema_nodeid(yspec1, "/yanglib:yang-library", &ylib) < 0 || ylib == NULL)
+            continue;
+        /* Get module-set from yang-library */
+        xmodset = xpath_first(xyanglib, 0, "module-set");
+        if (xmodset == NULL)
+            continue;
+        modset_name = xml_find_body(xmodset, "name");
+        if (modset_name == NULL)
+            continue;
+        /* Output yang-library under /devices/device/config with only standard elements */
+        cprintf(cb, "<devices xmlns=\"%s\"><device><name>%s</name><config>",
+                CONTROLLER_NAMESPACE, name);
+        cprintf(cb, "<yang-library xmlns=\"urn:ietf:params:xml:ns:yang:ietf-yang-library\">");
+        cprintf(cb, "<module-set><name>%s</name>", modset_name);
+        /* Iterate through modules, outputting only standard yang-library elements */
+        xmod = NULL;
+        while ((xmod = xml_child_each(xmodset, xmod, CX_ELMNT)) != NULL) {
+            if (strcmp(xml_name(xmod), "module") != 0)
+                continue;
+            mod_name = xml_find_body(xmod, "name");
+            if (mod_name == NULL)
+                continue;
+            mod_revision = xml_find_body(xmod, "revision");
+            mod_namespace = xml_find_body(xmod, "namespace");
+            cprintf(cb, "<module><name>%s</name>", mod_name);
+            if (mod_revision)
+                cprintf(cb, "<revision>%s</revision>", mod_revision);
+            if (mod_namespace)
+                cprintf(cb, "<namespace>%s</namespace>", mod_namespace);
+            cprintf(cb, "</module>");
+        }
+        cprintf(cb, "</module-set></yang-library>");
+        cprintf(cb, "</config></device></devices>");
+        if (clixon_xml_parse_string(cbuf_get(cb), YB_NONE, NULL, &xstate, NULL) < 0)
+            goto done;
+        cbuf_reset(cb);
+    } /* yang-library */
     retval = 0;
  done:
     if (cb)
         cbuf_free(cb);
     return retval;
 }
+
